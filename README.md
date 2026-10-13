@@ -5,13 +5,14 @@
 
 This project aims to bring **Battlefield 2142** online play back by replacing the backend services EA shut down: the FESL login service (`fesl.ea.com`) and the GameSpy services.
 
-> **Status: early development.** The protocols are being reverse engineered from captured traffic. There is a tested FESL packet decoder, but no server yet.
+> **Status: early development.** The protocols are being reverse engineered from captured traffic. The FESL server handles Hello and Login; everything after Login is not implemented yet.
 
 ## Contents
 
 - [Roadmap](#roadmap)
 - [Repository layout](#repository-layout)
 - [Getting started](#getting-started)
+- [Running the FESL server](#running-the-fesl-server)
 - [Capturing game traffic](#capturing-game-traffic)
 - [FESL protocol overview](#fesl-protocol-overview)
 - [Contributing](#contributing)
@@ -22,7 +23,8 @@ This project aims to bring **Battlefield 2142** online play back by replacing th
 
 - [x] Capture game traffic, including SSL-encrypted FESL sessions
 - [x] FESL packet decoder and encoder, with tests that replay the captures
-- [ ] Basic FESL backend emulation for BF2142 (Hello, MemCheck, Login, entitlements, sub-accounts)
+- [x] FESL server: Hello, MemCheck, Login and keep-alive Ping
+- [ ] FESL entitlements, object inventory, sub-accounts and GameSpy pre-auth
 - [ ] GameSpy protocols and sub-accounts
 - [ ] Database backends (MySQL, PostgreSQL, SQLite3)
 - [ ] Daemonization of each service
@@ -32,9 +34,9 @@ This project aims to bring **Battlefield 2142** online play back by replacing th
 
 | Path | Contents |
 | --- | --- |
-| `src/server/` | FESL packet decoder/encoder (`fesl.c`, `fesl.h`) |
+| `src/server/` | FESL server (`fesl_server.c`), session handlers (`fesl_session.c`), packet decoder/encoder (`fesl.c`) and accounts file (`accounts.c`) |
 | `src/` | [stcppipe](http://aluigi.altervista.org/mytoolz.htm) capture proxy by Luigi Auriemma, and the minIni INI parser |
-| `tests/` | Unit tests and replay tests for the FESL decoder |
+| `tests/` | Decoder and session tests that replay the captures, and a server end-to-end test |
 | `stuff/pcap/` | Captured login sessions (`dump1.pcap` raw, `dump2_ssl.pcap` decrypted FESL) |
 | `stuff/info/` | Archived FESL protocol notes from aluigi's forum |
 | `doc/` | Licenses of the bundled third-party code |
@@ -43,14 +45,43 @@ This project aims to bring **Battlefield 2142** online play back by replacing th
 
 You need a C compiler, `make`, and `unzip`. Building stcppipe against the system OpenSSL also needs the OpenSSL headers (`libssl-dev` on Debian/Ubuntu).
 
-Run the FESL tests:
+Run the tests:
 
 ```sh
-make -C tests test               # unit tests + replay of stuff/pcap captures
+make -C tests test               # decoder and session tests, replaying stuff/pcap
 make -C tests test SANITIZE=1    # the same with AddressSanitizer/UBSan
+
+make -C src/server               # server end-to-end test, needs Python 3 and openssl
+cd tests && python3 test_server.py
 ```
 
-CI runs both of these, plus the stcppipe build, on every pull request and on every push to `master`.
+CI runs all of these, plus the stcppipe build, on every pull request and on every push to `master`.
+
+## Running the FESL server
+
+The game connects with **SSLv3**, so build the server against the private SSLv3 OpenSSL (see [below](#capturing-game-traffic)):
+
+```sh
+cd src/server
+make ssl3
+openssl req -x509 -newkey rsa:1024 -nodes -days 365 -subj /CN=fesl -keyout cert.pem -out cert.pem
+./fesl_server -c cert.pem -a accounts.example.txt     # listens on port 18300
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-c CERT` | PEM file with the certificate and its passwordless private key |
+| `-a ACCOUNTS` | Accounts file, one `name password user_id` per line (see `accounts.example.txt`) |
+| `-p PORT` / `-b IP` | Listening port (default 18300) and address |
+| `-X METHOD` | `ssl3` (default) or `tls`. A plain `make` build has no SSLv3 and needs `-X tls` |
+| `-i SECONDS` | Idle time before the server pings the client (default 30) |
+
+The server answers Hello (and sends the MemCheck that follows it) and Login, and pings idle clients. Any other request gets a "Not implemented" error (`errorCode=99`).
+
+> [!NOTE]
+> - The accounts file stores passwords in clear text. It's a stand-in until database support exists.
+> - The error codes (101 user not found, 122 wrong password) come from other FESL emulators and haven't been checked against the game.
+> - The game may reject a self-signed certificate. That hasn't been tested yet.
 
 ## Capturing game traffic
 

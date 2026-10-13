@@ -11,20 +11,27 @@ endif
 DATA		= data
 CAPTURES	= $(DATA)/d1/dump2_ssl.pcap $(DATA)/d2/dump2_ssl.pcap
 
-all: test_fesl
+SERVER		= ../src/server
+SESSION_SRC	= $(SERVER)/fesl_session.c $(SERVER)/accounts.c $(SERVER)/fesl.c
 
-test_fesl: test_fesl.c pcap_stream.c pcap_stream.h ../src/server/fesl.c ../src/server/fesl.h
-	$(CC) $(CFLAGS) test_fesl.c pcap_stream.c ../src/server/fesl.c -o $@ $(LDFLAGS)
+all: test_fesl test_fesl_session
+
+test_fesl: test_fesl.c pcap_stream.c pcap_stream.h $(SERVER)/fesl.c $(SERVER)/fesl.h
+	$(CC) $(CFLAGS) test_fesl.c pcap_stream.c $(SERVER)/fesl.c -o $@ $(LDFLAGS)
+
+test_fesl_session: test_fesl_session.c pcap_stream.c pcap_stream.h $(SESSION_SRC) $(SERVER)/*.h
+	$(CC) $(CFLAGS) test_fesl_session.c pcap_stream.c $(SESSION_SRC) -o $@ $(LDFLAGS)
 
 $(DATA)/%/dump2_ssl.pcap: ../stuff/pcap/%.zip
 	mkdir -p $(DATA)/$*
 	unzip -o -q $< -d $(DATA)/$*
 	touch $@
 
-test: test_fesl $(CAPTURES)
+test: test_fesl test_fesl_session $(CAPTURES)
 	./test_fesl $(DATA)
+	./test_fesl_session $(DATA)
 
 clean:
-	rm -rf test_fesl $(DATA)
+	rm -rf test_fesl test_fesl_session $(DATA)
 
 .PHONY: all test clean
