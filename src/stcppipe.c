@@ -138,8 +138,18 @@ typedef uint32_t    u32;
 #define VER             "0.4.8b"
 #define BUFFSZ          8192
 #define XORBYTE         0xff
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+// security level 0 is needed for the old protocols and ciphers used by the games
+#define SSL_COMPAT(X)   SSL_CTX_set_cipher_list(X, "ALL:@SECLEVEL=0"); \
+                        SSL_CTX_set_options(X, SSL_OP_ALL); \
+                        if(ssl_proto) { \
+                            SSL_CTX_set_min_proto_version(X, ssl_proto); \
+                            SSL_CTX_set_max_proto_version(X, ssl_proto); \
+                        }
+#else
 #define SSL_COMPAT(X)   SSL_CTX_set_cipher_list(X, "ALL"); \
                         SSL_CTX_set_options(X, SSL_OP_ALL);
+#endif
 
 #define ACPT_CHK(a,b,c) psz = sizeof(struct sockaddr_in); \
                         a = accept(b, (struct sockaddr *)&c, &psz); \
@@ -739,7 +749,14 @@ int myrecv(SSL *ssl_sd, int sd, u8 *data, int datasz) {
 
 
 int pem_passwd_cb(char *buf, int num, int rwflag, void *userdata) {
-    return(sprintf(buf, "%s", ssl_cert_pass));
+    int     len;
+
+    if(!ssl_cert_pass || (num <= 0)) return(0);
+    len = strlen(ssl_cert_pass);
+    if(len >= num) len = num - 1;
+    memcpy(buf, ssl_cert_pass, len);
+    buf[len] = 0;
+    return(len);
 }
 
 
@@ -761,6 +778,7 @@ void handle_connections(int sock, int sd_one, int *sd_array, struct sockaddr_in 
     SSL_CTX     **ctx_sd    = NULL,
                 *ctx_sock   = NULL;
     SSL_METHOD  *ssl_method = NULL;
+    int         ssl_proto   = 0;    // 0 = any version
 #endif
     SSL         **ssl_sd    = NULL,
                 *ssl_sock   = NULL;
@@ -802,18 +820,40 @@ void handle_connections(int sock, int sd_one, int *sd_array, struct sockaddr_in 
 #ifdef ENABLE_SSL
     if(dossl) {
         // it's made to keep compatibility with the old numeric-only format, don't touch the order
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        // OpenSSL 1.1+ has only version-flexible methods, the protocol is pinned with min/max versions
+        ssl_method = (SSL_METHOD *)TLS_method();
+        if(ssl_method_type && ssl_method_type[0])  {
+                 if(!stricmp(ssl_method_type, "ssl")    || !stricmp(ssl_method_type, "ssl23") || !stricmp(ssl_method_type, "sslv23") || !stricmp(ssl_method_type, "23")) ssl_proto = 0;
+            else if(!stricmp(ssl_method_type, "ssl2")   || !stricmp(ssl_method_type, "sslv2") || !stricmp(ssl_method_type, "2")) {
+                fprintf(stderr, "\nError: SSLv2 is not supported by this OpenSSL version\n");
+                exit(1);
+            }
+            else if(!stricmp(ssl_method_type, "ssl3")   || !stricmp(ssl_method_type, "sslv3") || !stricmp(ssl_method_type, "3")) ssl_proto = SSL3_VERSION;
+            else if(!stricmp(ssl_method_type, "tls")    || !stricmp(ssl_method_type, "tls1")  || !stricmp(ssl_method_type, "tlsv1")) ssl_proto = TLS1_VERSION;
+            else if(!stricmp(ssl_method_type, "tls1_1") || !stricmp(ssl_method_type, "tlsv1_1")) ssl_proto = TLS1_1_VERSION;
+            else if(!stricmp(ssl_method_type, "tls1_2") || !stricmp(ssl_method_type, "tlsv1_2")) ssl_proto = TLS1_2_VERSION;
+            else if(!stricmp(ssl_method_type, "dtls")   || !stricmp(ssl_method_type, "dtls1") || !stricmp(ssl_method_type, "dtlsv1")) {
+                ssl_method = (SSL_METHOD *)DTLS_method();
+                ssl_proto  = DTLS1_VERSION;
+            }
+        }
+#else
         if(ssl_method_type && ssl_method_type[0])  {
                  if(!stricmp(ssl_method_type, "ssl")    || !stricmp(ssl_method_type, "ssl23") || !stricmp(ssl_method_type, "sslv23") || !stricmp(ssl_method_type, "23")) ssl_method = (SSL_METHOD *)SSLv23_method();
             #ifndef OPENSSL_NO_SSL2
             else if(!stricmp(ssl_method_type, "ssl2")   || !stricmp(ssl_method_type, "sslv2") || !stricmp(ssl_method_type, "2")) ssl_method = (SSL_METHOD *)SSLv2_method();
             #endif
+            #ifndef OPENSSL_NO_SSL3_METHOD
             else if(!stricmp(ssl_method_type, "ssl3")   || !stricmp(ssl_method_type, "sslv3") || !stricmp(ssl_method_type, "3")) ssl_method = (SSL_METHOD *)SSLv3_method();
+            #endif
             else if(!stricmp(ssl_method_type, "tls")    || !stricmp(ssl_method_type, "tls1")  || !stricmp(ssl_method_type, "tlsv1")) ssl_method = (SSL_METHOD *)TLSv1_method();
             else if(!stricmp(ssl_method_type, "tls1_1") || !stricmp(ssl_method_type, "tlsv1_1")) ssl_method = (SSL_METHOD *)TLSv1_1_method();
             else if(!stricmp(ssl_method_type, "tls1_2") || !stricmp(ssl_method_type, "tlsv1_2")) ssl_method = (SSL_METHOD *)TLSv1_2_method();
             else if(!stricmp(ssl_method_type, "dtls")   || !stricmp(ssl_method_type, "dtls1") || !stricmp(ssl_method_type, "dtlsv1")) ssl_method = (SSL_METHOD *)DTLSv1_method();
         }
         if(!ssl_method) ssl_method = (SSL_METHOD *)SSLv23_method();
+#endif
     }
 
     if(dossl & 1) { // input is SSL
@@ -857,14 +897,14 @@ void handle_connections(int sock, int sd_one, int *sd_array, struct sockaddr_in 
     }
 
     if(dossl & 2) { // output is SSL
-        ctx_sd = calloc(socks, sizeof(SSL_CTX));
+        ctx_sd = calloc(socks, sizeof(SSL_CTX *));
         if(!ctx_sd) goto quit;
         for(i = 0; i < socks; i++) {
             ctx_sd[i] = SSL_CTX_new(ssl_method);
             if(!ctx_sd[i]) goto quit;
             SSL_COMPAT(ctx_sd[i])
         }
-        ssl_sd = calloc(socks, sizeof(SSL));
+        ssl_sd = calloc(socks, sizeof(SSL *));
         if(!ssl_sd) goto quit;
         for(i = 0; i < socks; i++) {
             ssl_sd[i] = SSL_new(ctx_sd[i]);
