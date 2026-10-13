@@ -14,3 +14,6 @@ src/stcppipe
 *.pem
 *.key
 *.crt
+
+# Private OpenSSL build made by src/build-openssl-ssl3.sh
+src/openssl-ssl3/
