@@ -17,3 +17,7 @@ src/stcppipe
 
 # Private OpenSSL build made by src/build-openssl-ssl3.sh
 src/openssl-ssl3/
+
+# Test binary and captures extracted by tests/Makefile
+tests/test_fesl
+tests/data/

@@ -32,6 +32,15 @@ This OpenSSL build is insecure on purpose: only use it for this capture proxy. `
 Windows binaries are available from the author's site: http://aluigi.altervista.org/mytoolz.htm
 
 
+FESL packet decoder
+---------------------
+
+`src/server/fesl.c` decodes and encodes FESL packets: the 12-byte header (command, type, packet number, size), the `key=value` body, and multipart packets (base64 pieces). `tests/` replays the decrypted login sessions in `stuff/pcap/` through the decoder:
+
+    cd tests && make test            # needs unzip
+    make test SANITIZE=1             # with AddressSanitizer/UBSan
+
+
 If you wish to modify the code and add support for your game, or add any additional features, please feel free to make a **fork** and submit a [pull request].
 
 
