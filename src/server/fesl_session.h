@@ -22,10 +22,18 @@
 
 #define FESL_LKEY_SIZE      28      // 27 characters + '.', like the captured answers
 
-// error codes used by other FESL emulators, not verified against the game yet
+// Login error codes: 101 and 122 are used by the BFBC2 and NFS Carbon
+// emulators, the others were checked against the NFS Carbon client by
+// NFS-Online-Server. None of them is verified against BF2142 yet.
 #define FESL_ERROR_SYSTEM           99
 #define FESL_ERROR_USER_NOT_FOUND   101
+#define FESL_ERROR_ACCOUNT_DISABLED 102
+#define FESL_ERROR_ACCOUNT_BANNED   103
+#define FESL_ERROR_ACCOUNT_PENDING  105
+#define FESL_ERROR_TOO_MANY_ATTEMPTS 121
 #define FESL_ERROR_BAD_PASSWORD     122
+
+#define FESL_MAX_LOGIN_ATTEMPTS     5   // failed Logins per connection before 121
 
 enum {
     FESL_SESSION_CONTINUE = 0,
@@ -46,6 +54,7 @@ typedef struct {
 
     int         hello_done;
     const fesl_account *account;        // logged in account or NULL
+    int         failed_logins;
     char        lkey[FESL_LKEY_SIZE + 1];
 } fesl_session;
 

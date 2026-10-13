@@ -86,14 +86,14 @@ static const fesl_packet *find_txn(const packet_list *list, const char *txn) {
 }
 
 // same header and same keys in the same order, values compared unless listed in skip
-static void compare_answer(const fesl_packet *ours, const fesl_packet *captured, const char **skip) {
+static void compare_answer(const fesl_packet *ours, const fesl_packet *captured, const char **skip, int same_number) {
     size_t  i,
             j;
     int     skipped;
 
     CHECK_STR(ours->command, captured->command);
     CHECK(ours->type == captured->type);
-    CHECK(ours->number == captured->number);
+    if(same_number) CHECK(ours->number == captured->number);
     CHECK(ours->count == captured->count);
     for(i = 0; (i < ours->count) && (i < captured->count); i++) {
         CHECK_STR(ours->pairs[i].key, captured->pairs[i].key);
@@ -103,6 +103,17 @@ static void compare_answer(const fesl_packet *ours, const fesl_packet *captured,
         }
         if(!skipped) CHECK_STR(ours->pairs[i].value, captured->pairs[i].value);
     }
+}
+
+// our answer to the request with this command and number
+static const fesl_packet *find_answer(const packet_list *list, const char *command, uint32_t number, const char *txn) {
+    size_t  i;
+
+    for(i = 0; i < list->count; i++) {
+        if(!strcmp(list->pkt[i].command, command) && (list->pkt[i].number == number) &&
+           fesl_txn(&list->pkt[i]) && !strcmp(fesl_txn(&list->pkt[i]), txn)) return &list->pkt[i];
+    }
+    return NULL;
 }
 
 static void test_replay(const char *path, int exact_time) {
@@ -116,12 +127,11 @@ static void test_replay(const char *path, int exact_time) {
     fesl_accounts accounts;
     fesl_session session;
     fesl_output out = { 0 };
-    const fesl_packet *hello,
-                *memcheck,
-                *login,
-                *p;
+    const fesl_packet *captured,
+                *mine;
     uint32_t    rnd = 1;
     size_t      i;
+    int         inventories = 0;
     char        curtime[64];
 
     printf("session replay %s\n", path);
@@ -131,36 +141,53 @@ static void test_replay(const char *path, int exact_time) {
     CHECK(decode_all(s.to_server.data, s.to_server.len, &client) == 0);
     CHECK(decode_all(s.to_client.data, s.to_client.len, &server) == 0);
 
-    // the client packets up to Login, in capture order
+    // every client packet in capture order, the ones we don't handle yet
+    // just get an error answer
     fesl_session_init(&session, &accounts, counter_random, &rnd);
     for(i = 0; i < client.count; i++) {
-        p = &client.pkt[i];
-        CHECK(fesl_session_handle(&session, p, D1_HELLO_TIME, &out) == FESL_SESSION_CONTINUE);
-        if(!strcmp(fesl_txn(p), "Login")) break;
+        CHECK(fesl_session_handle(&session, &client.pkt[i], D1_HELLO_TIME, &out) == FESL_SESSION_CONTINUE);
     }
     CHECK(session.account && !strcmp(session.account->name, "Tema567"));
-
     CHECK(decode_all(out.data, out.len, &ours) == 0);
-    CHECK(ours.count == 3);     // Hello, MemCheck, Login (the client MemCheck gets no answer)
-    if(ours.count == 3) {
-        hello    = find_txn(&server, "Hello");
-        memcheck = find_txn(&server, "MemCheck");
-        login    = find_txn(&server, "Login");
-        CHECK(hello && memcheck && login);
-        if(hello && memcheck && login) {
-            compare_answer(&ours.pkt[0], hello, exact_time ? NULL : hello_skip);
-            compare_answer(&ours.pkt[1], memcheck, memcheck_skip);
-            compare_answer(&ours.pkt[2], login, login_skip);
-        }
+
+    // Hello is answered first, then comes our MemCheck with number 0 while the
+    // capture (made against an emulator) reused the Hello number
+    CHECK(ours.count >= 2);
+    if(ours.count >= 2) {
+        captured = find_txn(&server, "Hello");
+        CHECK(captured != NULL);
+        if(captured) compare_answer(&ours.pkt[0], captured, exact_time ? NULL : hello_skip, 1);
+        captured = find_txn(&server, "MemCheck");
+        CHECK(captured != NULL);
+        if(captured) compare_answer(&ours.pkt[1], captured, memcheck_skip, 0);
+        CHECK(ours.pkt[1].number == 0);
+        CHECK(ours.pkt[1].type == FESL_TYPE_SINGLE_SERVER);
+        CHECK(strtoul(fesl_get(&ours.pkt[1], "salt"), NULL, 10) <= 0x7fffffff);
 
         // curTime keeps the captured format with escaped colons
         snprintf(curtime, sizeof(curtime), "%s", fesl_get(&ours.pkt[0], "curTime"));
         CHECK_STR(curtime, "\"Sep-03-2015 16%3a01%3a12 UTC\"");
-        CHECK(strtoul(fesl_get(&ours.pkt[1], "salt"), NULL, 10) <= 0x7fffffff);
-        CHECK(strlen(fesl_get(&ours.pkt[2], "lkey")) == FESL_LKEY_SIZE);
-        CHECK(fesl_get(&ours.pkt[2], "lkey")[FESL_LKEY_SIZE - 1] == '.');
-        CHECK_STR(fesl_get(&ours.pkt[2], "lkey"), session.lkey);
     }
+
+    // the handled answers match the captured ones
+    for(i = 0; i < server.count; i++) {
+        captured = &server.pkt[i];
+        if(!strcmp(fesl_txn(captured), "Login")) {
+            mine = find_answer(&ours, captured->command, captured->number, "Login");
+            CHECK(mine != NULL);
+            if(!mine) continue;
+            compare_answer(mine, captured, login_skip, 1);
+            CHECK(strlen(fesl_get(mine, "lkey")) == FESL_LKEY_SIZE);
+            CHECK(fesl_get(mine, "lkey")[FESL_LKEY_SIZE - 1] == '.');
+            CHECK_STR(fesl_get(mine, "lkey"), session.lkey);
+        } else if(!strcmp(fesl_txn(captured), "GetObjectInventory")) {
+            mine = find_answer(&ours, captured->command, captured->number, "GetObjectInventory");
+            CHECK(mine != NULL);
+            if(mine) compare_answer(mine, captured, NULL, 1);
+            inventories++;
+        }
+    }
+    CHECK(inventories == 3);
 
     free_list(&ours);
     free_list(&client);
@@ -216,15 +243,27 @@ static int handle_one(fesl_session *s, const char *command, uint32_t number, con
     return ret;
 }
 
-static void check_error(const packet_list *ans, const char *command, uint32_t number, const char *txn, const char *code) {
+// field is the expected errorContainer field name, or NULL for none
+static void check_field_error(const packet_list *ans, const char *command, uint32_t number, const char *txn, const char *code, const char *field) {
     CHECK(ans->count == 1);
     if(ans->count != 1) return;
     CHECK_STR(ans->pkt[0].command, command);
     CHECK(ans->pkt[0].number == number);
     CHECK_STR(fesl_txn(&ans->pkt[0]), txn);
     CHECK_STR(fesl_get(&ans->pkt[0], "errorCode"), code);
-    CHECK_STR(fesl_get(&ans->pkt[0], "errorContainer.[]"), "0");
     CHECK(fesl_get(&ans->pkt[0], "localizedMessage") != NULL);
+    if(field) {
+        CHECK_STR(fesl_get(&ans->pkt[0], "errorContainer.[]"), "1");
+        CHECK_STR(fesl_get(&ans->pkt[0], "errorContainer.0.fieldName"), field);
+        CHECK_STR(fesl_get(&ans->pkt[0], "errorContainer.0.fieldError"), code);
+    } else {
+        CHECK_STR(fesl_get(&ans->pkt[0], "errorContainer.[]"), "0");
+        CHECK(fesl_get(&ans->pkt[0], "errorContainer.0.fieldName") == NULL);
+    }
+}
+
+static void check_error(const packet_list *ans, const char *command, uint32_t number, const char *txn, const char *code) {
+    check_field_error(ans, command, number, txn, code, NULL);
 }
 
 static void test_session_errors(void) {
@@ -251,17 +290,22 @@ static void test_session_errors(void) {
     free_list(&ans);
 
     CHECK(handle_one(&s, "acct", 4, "TXN=Login\nname=Tema567\npassword=wrong\n", &ans) == FESL_SESSION_CONTINUE);
-    check_error(&ans, "acct", 4, "Login", "122");
+    check_field_error(&ans, "acct", 4, "Login", "122", "password");
     CHECK(!s.account);
     free_list(&ans);
 
     CHECK(handle_one(&s, "acct", 5, "TXN=Login\nname=Tema567\n", &ans) == FESL_SESSION_CONTINUE);
-    check_error(&ans, "acct", 5, "Login", "122");
+    check_field_error(&ans, "acct", 5, "Login", "122", "password");
     free_list(&ans);
 
     CHECK(handle_one(&s, "acct", 6, "TXN=Login\nencryptedInfo=1111\n", &ans) == FESL_SESSION_CONTINUE);
     check_error(&ans, "acct", 6, "Login", "101");
     free_list(&ans);
+
+    CHECK(handle_one(&s, "acct", 12, "TXN=Login\nname=\npassword=123456\n", &ans) == FESL_SESSION_CONTINUE);
+    check_field_error(&ans, "acct", 12, "Login", "101", "name");
+    free_list(&ans);
+    CHECK(s.failed_logins == 4);
 
     // names are case-insensitive, no encryptedLoginInfo unless asked for
     CHECK(handle_one(&s, "acct", 7, "TXN=Login\nname=OTHER\npassword=secret\n", &ans) == FESL_SESSION_CONTINUE);
@@ -273,11 +317,25 @@ static void test_session_errors(void) {
         CHECK(fesl_get(&ans.pkt[0], "encryptedLoginInfo") == NULL);
     }
     CHECK(s.account && (s.account->user_id == 11));
+    CHECK(s.failed_logins == 0);    // reset by a successful login
     free_list(&ans);
 
     // a failed new login logs out
     CHECK(handle_one(&s, "acct", 8, "TXN=Login\nname=other\npassword=bad\n", &ans) == FESL_SESSION_CONTINUE);
     CHECK(!s.account);
+    free_list(&ans);
+
+    // the inventory is always empty for now
+    CHECK(handle_one(&s, "dobj", 13, "TXN=GetObjectInventory\ndomainId=eagames\nsubdomainId=bf2142\n"
+        "partitionKey=online_content\nobjectIds.[]=1\nobjectIds.0=bf2142_bp1\n", &ans) == FESL_SESSION_CONTINUE);
+    CHECK(ans.count == 1);
+    if(ans.count == 1) {
+        CHECK_STR(ans.pkt[0].command, "dobj");
+        CHECK(ans.pkt[0].number == 13);
+        CHECK_STR(fesl_txn(&ans.pkt[0]), "GetObjectInventory");
+        CHECK_STR(fesl_get(&ans.pkt[0], "entitlements.[]"), "0");
+        CHECK(ans.pkt[0].count == 2);
+    }
     free_list(&ans);
 
     // not implemented yet
@@ -304,6 +362,65 @@ static void test_session_errors(void) {
     fesl_accounts_free(&accounts);
 }
 
+static void test_account_status(void) {
+    static const struct {
+        const char  *name,
+                    *code;
+    } cases[] = {
+        { "dis", "102" },
+        { "ban", "103" },
+        { "pend", "105" }
+    };
+    fesl_accounts accounts;
+    fesl_session s;
+    packet_list ans;
+    uint32_t    rnd = 1;
+    char        login[128];
+    size_t      i;
+
+    CHECK(fesl_accounts_parse(&accounts, "dis pw 1 disabled\nban pw 2 BANNED\npend pw 3 pending\nok pw 4 active\n") == 0);
+    fesl_session_init(&s, &accounts, counter_random, &rnd);
+    CHECK(handle_one(&s, "fsys", 1, "TXN=Hello\n", &ans) == FESL_SESSION_CONTINUE);
+    free_list(&ans);
+
+    for(i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        // the status is only revealed with the right password
+        snprintf(login, sizeof(login), "TXN=Login\nname=%s\npassword=bad\n", cases[i].name);
+        CHECK(handle_one(&s, "acct", 2, login, &ans) == FESL_SESSION_CONTINUE);
+        check_field_error(&ans, "acct", 2, "Login", "122", "password");
+        free_list(&ans);
+
+        snprintf(login, sizeof(login), "TXN=Login\nname=%s\npassword=pw\n", cases[i].name);
+        CHECK(handle_one(&s, "acct", 3, login, &ans) == FESL_SESSION_CONTINUE);
+        check_error(&ans, "acct", 3, "Login", cases[i].code);
+        CHECK(!s.account);
+        free_list(&ans);
+    }
+    CHECK(s.failed_logins == 3);
+
+    // after FESL_MAX_LOGIN_ATTEMPTS failures even the right password gets 121
+    CHECK(handle_one(&s, "acct", 4, "TXN=Login\nname=nobody\npassword=pw\n", &ans) == FESL_SESSION_CONTINUE);
+    free_list(&ans);
+    CHECK(handle_one(&s, "acct", 5, "TXN=Login\nname=ok\npassword=bad\n", &ans) == FESL_SESSION_CONTINUE);
+    free_list(&ans);
+    CHECK(s.failed_logins == FESL_MAX_LOGIN_ATTEMPTS);
+    CHECK(handle_one(&s, "acct", 6, "TXN=Login\nname=ok\npassword=pw\n", &ans) == FESL_SESSION_CONTINUE);
+    check_error(&ans, "acct", 6, "Login", "121");
+    CHECK(!s.account);
+    free_list(&ans);
+
+    // a new connection starts over
+    fesl_session_init(&s, &accounts, counter_random, &rnd);
+    CHECK(handle_one(&s, "fsys", 1, "TXN=Hello\n", &ans) == FESL_SESSION_CONTINUE);
+    free_list(&ans);
+    CHECK(handle_one(&s, "acct", 2, "TXN=Login\nname=ok\npassword=pw\n", &ans) == FESL_SESSION_CONTINUE);
+    CHECK(ans.count == 1 && !fesl_get(&ans.pkt[0], "errorCode"));
+    CHECK(s.account && (s.account->status == ACCOUNT_ACTIVE));
+    free_list(&ans);
+
+    fesl_accounts_free(&accounts);
+}
+
 static void test_accounts(void) {
     fesl_accounts a;
     char        longname[64];
@@ -316,9 +433,11 @@ static void test_accounts(void) {
     CHECK(a.count == 0);
     fesl_accounts_free(&a);
 
-    CHECK(fesl_accounts_parse(&a, "a pw 1\r\n\tb\tpw2\t2 #x\nc pw3 4294967295") == 0);
+    CHECK(fesl_accounts_parse(&a, "a pw 1\r\n\tb\tpw2\t2 #x\nc pw3 4294967295 Pending\r\n") == 0);
     CHECK(a.count == 3);
     if(a.count == 3) {
+        CHECK(a.list[0].status == ACCOUNT_ACTIVE);
+        CHECK(a.list[2].status == ACCOUNT_PENDING);
         CHECK_STR(a.list[0].name, "a");
         CHECK_STR(a.list[0].password, "pw");
         CHECK(a.list[0].user_id == 1);
@@ -331,8 +450,10 @@ static void test_accounts(void) {
 
     // the 1-based number of the first bad line is returned
     CHECK(fesl_accounts_parse(&a, "a pw 1\nb pw\n") == 2);
-    CHECK(fesl_accounts_parse(&a, "a pw 1 extra\n") == 1);
+    CHECK(fesl_accounts_parse(&a, "a pw 1 extra\n") == 1);     // unknown status
     CHECK(fesl_accounts_parse(&a, "a pw 1 x\n") == 1);
+    CHECK(fesl_accounts_parse(&a, "a pw 1 banned extra\n") == 1);
+    CHECK(fesl_accounts_parse(&a, "a pw 1 averyveryverylongstatus\n") == 1);
     CHECK(fesl_accounts_parse(&a, "a pw 0\n") == 1);
     CHECK(fesl_accounts_parse(&a, "a pw 12x\n") == 1);
     CHECK(fesl_accounts_parse(&a, "a pw 4294967296\n") == 1);
@@ -356,6 +477,7 @@ int main(int argc, char *argv[]) {
 
     test_accounts();
     test_session_errors();
+    test_account_status();
 
     snprintf(path, sizeof(path), "%s/d1/dump2_ssl.pcap", dir);
     test_replay(path, 1);

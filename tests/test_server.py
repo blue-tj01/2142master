@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # FESL server end-to-end test: starts fesl_server with -X tls (Python's ssl
-# module can't speak SSLv3) and logs in like the game does.
+# module can't speak SSLv3) and with -X none (plain TCP), and logs in like
+# the game does.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -41,12 +42,14 @@ def encode(command, word, body):
 
 
 class Client:
-    def __init__(self, port):
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ctx.set_ciphers("ALL:@SECLEVEL=0")
-        self.sock = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=10))
+    def __init__(self, port, use_ssl):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        if use_ssl:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.set_ciphers("ALL:@SECLEVEL=0")
+            self.sock = ctx.wrap_socket(self.sock)
         self.buf = b""
 
     def send(self, command, word, body):
@@ -80,21 +83,14 @@ def free_port():
         return s.getsockname()[1]
 
 
-def main():
-    tmp = tempfile.mkdtemp()
-    cert = os.path.join(tmp, "cert.pem")
-    accounts = os.path.join(tmp, "accounts.txt")
-    log = os.path.join(tmp, "server.log")
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-subj", "/CN=fesl", "-keyout", cert, "-out", cert],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    with open(accounts, "w") as f:
-        f.write("Tema567 123456 10\n")
-
+def run(method, cert, accounts, log):
+    use_ssl = method != "none"
     port = free_port()
+    args = [SERVER, "-X", method, "-p", str(port), "-a", accounts, "-i", str(PING_INTERVAL)]
+    if use_ssl:
+        args += ["-c", cert]
     with open(log, "w") as logf:
-        server = subprocess.Popen([SERVER, "-X", "tls", "-p", str(port), "-c", cert, "-a", accounts,
-                                   "-i", str(PING_INTERVAL)], stdout=logf, stderr=subprocess.STDOUT)
+        server = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT)
     try:
         for _ in range(50):
             try:
@@ -103,15 +99,15 @@ def main():
             except OSError:
                 time.sleep(0.1)
 
-        # Hello, the server MemCheck and our answer to it
-        c = Client(port)
+        # Hello, then the server MemCheck with number 0, and our answer to it
+        c = Client(port, use_ssl)
         c.send("fsys", 0x80000001, HELLO)
         cmd, word, hello = c.recv()
         check((cmd, word, hello.get("TXN")) == ("fsys", 0x80000001, "Hello"), "Hello answer header")
         check(hello.get("domainPartition.subDomain") == "battlefield2142-2006", "Hello subDomain")
         check("%3a" in hello.get("curTime", ""), "Hello curTime format")
         cmd, word, memcheck = c.recv()
-        check((cmd, word, memcheck.get("TXN")) == ("fsys", 0x80000001, "MemCheck"), "MemCheck from server")
+        check((cmd, word, memcheck.get("TXN")) == ("fsys", 0x80000000, "MemCheck"), "MemCheck from server")
         c.send("fsys", 0x80000000, "TXN=MemCheck\nresult=\n")
 
         # successful Login
@@ -121,34 +117,53 @@ def main():
         check(login.get("displayName") == "Tema567" and login.get("userId") == "10", "Login account")
         check(len(login.get("lkey", "")) == 28 and "errorCode" not in login, "Login lkey")
 
-        # keep-alive Ping after PING_INTERVAL seconds of silence
+        c.send("dobj", 0x80000003, "TXN=GetObjectInventory\ndomainId=eagames\nsubdomainId=bf2142\n"
+               "partitionKey=online_content\nobjectIds.[]=1\nobjectIds.0=bf2142_bp1\n")
+        cmd, word, inv = c.recv()
+        check((cmd, word, inv) == ("dobj", 0x80000003, {"TXN": "GetObjectInventory", "entitlements.[]": "0"}),
+              "GetObjectInventory answer")
+
+        # the server Ping comes every PING_INTERVAL seconds, also while the
+        # client keeps sending (our Ping answers get no reply)
         start = time.time()
-        cmd, word, ping = c.recv()
-        check((cmd, word, ping.get("TXN")) == ("fsys", 0, "Ping"), "server Ping")
-        check(time.time() - start >= PING_INTERVAL * 0.8, "Ping waited for the idle time")
-        c.send("fsys", 0x80000000, "TXN=Ping\n")
+        pings = []
+        while time.time() - start < PING_INTERVAL * 2.6:
+            c.send("fsys", 0x80000000, "TXN=Ping\n")
+            c.sock.settimeout(0.2)
+            try:
+                pkt = c.recv()
+            except (socket.timeout, ssl.SSLError, TimeoutError):
+                pkt = None
+            c.sock.settimeout(10)
+            if pkt:
+                check(pkt[:2] == ("fsys", 0) and pkt[2].get("TXN") == "Ping", "only Pings while busy")
+                pings.append(time.time() - start)
+        gaps = [b - a for a, b in zip(pings, pings[1:])]
+        check(len(pings) >= 2 and all(g >= PING_INTERVAL * 0.7 for g in gaps),
+              "Pings every %ds while busy: %r" % (PING_INTERVAL, pings))
 
         # not implemented yet
-        c.send("subs", 0x80000003, "TXN=GetEntitlementByBundle\nbundleId=REG-PC-BF2142-UNLOCK-1\n")
+        c.send("subs", 0x80000004, "TXN=GetEntitlementByBundle\nbundleId=REG-PC-BF2142-UNLOCK-1\n")
         cmd, word, ent = c.recv()
-        check((cmd, word, ent.get("errorCode")) == ("subs", 0x80000003, "99"), "not implemented error")
+        check((cmd, word, ent.get("errorCode")) == ("subs", 0x80000004, "99"), "not implemented error")
 
         # Goodbye closes the connection
-        c.send("fsys", 0x80000004, "TXN=Goodbye\nreason=GOODBYE_CLIENT_NORMAL\n")
+        c.send("fsys", 0x80000005, "TXN=Goodbye\nreason=GOODBYE_CLIENT_NORMAL\n")
         check(c.recv() is None, "connection closed after Goodbye")
         c.close()
 
         # wrong password on a second connection
-        c = Client(port)
+        c = Client(port, use_ssl)
         c.send("fsys", 0x80000001, HELLO)
         c.recv()
         c.recv()
         c.send("acct", 0x80000002, LOGIN.format(password="wrong-password"))
         cmd, word, login = c.recv()
-        check(login.get("errorCode") == "122", "wrong password error")
+        check(login.get("errorCode") == "122" and login.get("errorContainer.0.fieldName") == "password",
+              "wrong password error")
         c.close()
 
-        # the server is still alive, and never logs passwords
+        # the server is still alive
         check(server.poll() is None, "server still running")
     finally:
         server.terminate()
@@ -158,9 +173,25 @@ def main():
         text = f.read()
     check("logged in as Tema567" in text, "login logged")
     check("123456" not in text and "wrong-password" not in text, "passwords not logged")
-    if failures:
-        print(text)
-    print("server test:", "%d failures" % failures if failures else "ok")
+    return text
+
+
+def main():
+    tmp = tempfile.mkdtemp()
+    cert = os.path.join(tmp, "cert.pem")
+    accounts = os.path.join(tmp, "accounts.txt")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=fesl", "-keyout", cert, "-out", cert],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(accounts, "w") as f:
+        f.write("Tema567 123456 10\n")
+
+    for method in ("tls", "none"):
+        before = failures
+        text = run(method, cert, accounts, os.path.join(tmp, "server-%s.log" % method))
+        if failures != before:
+            print(text)
+        print("server test (-X %s):" % method, "%d failures" % (failures - before) if failures != before else "ok")
     return 1 if failures else 0
 
 
