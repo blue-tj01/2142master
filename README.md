@@ -1,5 +1,11 @@
 # 2142 Master Server
 
+> [!IMPORTANT]
+> **This repository has moved and is archived.** Development continues in
+> [`fesl_server/` of blue-tj01/bf2142stats_emu](https://github.com/blue-tj01/bf2142stats_emu/tree/master/fesl_server),
+> which carries this repository's full history. There the server also reads accounts from the stats database's
+> `account` table and runs next to the stats server. Please open issues and pull requests there.
+
 [![test](https://github.com/blue-tj01/2142master/actions/workflows/test.yml/badge.svg)](https://github.com/blue-tj01/2142master/actions/workflows/test.yml)
 [![License: GPL v2](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
 
