@@ -1,0 +1,16 @@
+# Build output
+*.o
+*.obj
+*.exe
+src/stcppipe
+
+# Captures and dumps produced while reversing protocols
+# (archived capture sets in stuff/pcap/*.zip are tracked on purpose)
+*.acp
+*.pcap
+*.pcapng
+
+# Certificates and keys used for SSL interception
+*.pem
+*.key
+*.crt
