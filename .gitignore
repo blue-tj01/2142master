@@ -21,3 +21,5 @@ src/openssl-ssl3/
 # Test binary and captures extracted by tests/Makefile
 tests/test_fesl
 tests/data/
+src/server/fesl_server
+tests/test_fesl_session

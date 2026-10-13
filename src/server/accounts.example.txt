@@ -1,0 +1,3 @@
+# FESL test accounts: one "name password user_id" per line.
+# Passwords are stored in clear text, use this only for testing.
+Tema567 123456 10
