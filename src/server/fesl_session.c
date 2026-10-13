@@ -80,14 +80,25 @@ static int reply(fesl_output *out, const fesl_packet *req, const answer *a) {
     return output_append(out, req->command, FESL_TYPE_SINGLE_SERVER, req->number, a);
 }
 
-static int reply_error(fesl_output *out, const fesl_packet *req, int code, const char *message) {
+// field names the request field that caused the error, or NULL
+static int reply_field_error(fesl_output *out, const fesl_packet *req, int code, const char *message, const char *field) {
     answer  a = { .len = 0 };
 
     add(&a, "TXN", "%s", fesl_txn(req) ? fesl_txn(req) : "");
     add(&a, "localizedMessage", "\"%s\"", message);
-    add(&a, "errorContainer.[]", "0");
+    if(field) {
+        add(&a, "errorContainer.[]", "1");
+        add(&a, "errorContainer.0.fieldName", "%s", field);
+        add(&a, "errorContainer.0.fieldError", "%d", code);
+    } else {
+        add(&a, "errorContainer.[]", "0");
+    }
     add(&a, "errorCode", "%d", code);
     return reply(out, req, &a);
+}
+
+static int reply_error(fesl_output *out, const fesl_packet *req, int code, const char *message) {
+    return reply_field_error(out, req, code, message, NULL);
 }
 
 static int handle_hello(fesl_session *s, const fesl_packet *req, time_t now, fesl_output *out) {
@@ -113,14 +124,16 @@ static int handle_hello(fesl_session *s, const fesl_packet *req, time_t now, fes
     if(ret != FESL_SESSION_CONTINUE) return ret;
     s->hello_done = 1;
 
-    // the server follows up with a MemCheck using the same packet number,
-    // the client answers it with number 0 and doesn't expect anything back
+    // then an unsolicited MemCheck with packet number 0, like the real EA
+    // servers did for NFS Carbon (the BF2142 capture, made against an
+    // emulator, reuses the Hello number). The client answers it with
+    // number 0 and doesn't expect anything back.
     memset(&a, 0, sizeof(a));
     add(&a, "TXN", "MemCheck");
     add(&a, "memcheck.[]", "0");
     add(&a, "type", "0");
     add(&a, "salt", "%u", s->random(s->random_ctx) & 0x7fffffff);
-    return reply(out, req, &a);
+    return output_append(out, "fsys", FESL_TYPE_SINGLE_SERVER, 0, &a);
 }
 
 static void make_lkey(fesl_session *s) {
@@ -144,6 +157,9 @@ static int handle_login(fesl_session *s, const fesl_packet *req, fesl_output *ou
 
     s->account = NULL;  // a failed new login logs out
     if(!s->hello_done) return reply_error(out, req, FESL_ERROR_SYSTEM, "Hello expected");
+    if(s->failed_logins >= FESL_MAX_LOGIN_ATTEMPTS) {
+        return reply_error(out, req, FESL_ERROR_TOO_MANY_ATTEMPTS, "Too many failed login attempts");
+    }
 
     if(fesl_get(req, "encryptedInfo")) {
         // "remember me" logins send back the encryptedLoginInfo of a previous login
@@ -151,12 +167,33 @@ static int handle_login(fesl_session *s, const fesl_packet *req, fesl_output *ou
     }
     name     = fesl_get(req, "name");
     password = fesl_get(req, "password");
-    acc = name ? fesl_accounts_find(s->accounts, name) : NULL;
-    if(!acc) return reply_error(out, req, FESL_ERROR_USER_NOT_FOUND, "The user was not found");
+    if(!name || !*name) {
+        s->failed_logins++;
+        return reply_field_error(out, req, FESL_ERROR_USER_NOT_FOUND, "The user was not found", "name");
+    }
+    acc = fesl_accounts_find(s->accounts, name);
+    if(!acc) {
+        s->failed_logins++;
+        return reply_error(out, req, FESL_ERROR_USER_NOT_FOUND, "The user was not found");
+    }
     if(!password || strcmp(password, acc->password)) {
-        return reply_error(out, req, FESL_ERROR_BAD_PASSWORD, "The password the user specified is incorrect");
+        s->failed_logins++;
+        return reply_field_error(out, req, FESL_ERROR_BAD_PASSWORD, "The password the user specified is incorrect", "password");
     }
 
+    // checked after the password so the status isn't revealed without it
+    switch(acc->status) {
+        case ACCOUNT_DISABLED:
+            return reply_error(out, req, FESL_ERROR_ACCOUNT_DISABLED, "The account has been disabled");
+        case ACCOUNT_BANNED:
+            return reply_error(out, req, FESL_ERROR_ACCOUNT_BANNED, "The account has been banned");
+        case ACCOUNT_PENDING:
+            return reply_error(out, req, FESL_ERROR_ACCOUNT_PENDING, "The account is pending");
+        default:
+            break;
+    }
+
+    s->failed_logins = 0;
     s->account = acc;
     make_lkey(s);
 
@@ -180,6 +217,16 @@ static int handle_login(fesl_session *s, const fesl_packet *req, fesl_output *ou
     return reply(out, req, &a);
 }
 
+// BF2142 asks for the booster pack (objectIds.0=bf2142_bp1); both the
+// captured server and EA's NFS Carbon server answered with no entitlements
+static int handle_object_inventory(const fesl_packet *req, fesl_output *out) {
+    answer  a = { .len = 0 };
+
+    add(&a, "TXN", "GetObjectInventory");
+    add(&a, "entitlements.[]", "0");
+    return reply(out, req, &a);
+}
+
 void fesl_session_init(fesl_session *s, const fesl_accounts *accounts, uint32_t (*random)(void *), void *random_ctx) {
     memset(s, 0, sizeof(fesl_session));
     s->accounts   = accounts;
@@ -197,6 +244,8 @@ int fesl_session_handle(fesl_session *s, const fesl_packet *req, time_t now, fes
         if(!strcmp(txn, "MemCheck")) return FESL_SESSION_CONTINUE;  // answer to ours
         if(!strcmp(txn, "Ping"))     return FESL_SESSION_CONTINUE;  // answer to ours
         if(!strcmp(txn, "Goodbye"))  return FESL_SESSION_CLOSE;
+    } else if(!strcmp(req->command, "dobj")) {
+        if(!strcmp(txn, "GetObjectInventory")) return handle_object_inventory(req, out);
     } else if(!strcmp(req->command, "acct")) {
         if(!strcmp(txn, "Login"))    return handle_login(s, req, out);
     }

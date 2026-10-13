@@ -5,7 +5,7 @@
 
 This project aims to bring **Battlefield 2142** online play back by replacing the backend services EA shut down: the FESL login service (`fesl.ea.com`) and the GameSpy services.
 
-> **Status: early development.** The protocols are being reverse engineered from captured traffic. The FESL server handles Hello and Login; everything after Login is not implemented yet.
+> **Status: early development.** The protocols are being reverse engineered from captured traffic. The FESL server handles Hello, Login and GetObjectInventory; the other requests after Login are not implemented yet.
 
 ## Contents
 
@@ -23,8 +23,8 @@ This project aims to bring **Battlefield 2142** online play back by replacing th
 
 - [x] Capture game traffic, including SSL-encrypted FESL sessions
 - [x] FESL packet decoder and encoder, with tests that replay the captures
-- [x] FESL server: Hello, MemCheck, Login and keep-alive Ping
-- [ ] FESL entitlements, object inventory, sub-accounts and GameSpy pre-auth
+- [x] FESL server: Hello, MemCheck, Login, GetObjectInventory and keep-alive Ping
+- [ ] FESL entitlements, sub-accounts and GameSpy pre-auth
 - [ ] GameSpy protocols and sub-accounts
 - [ ] Database backends (MySQL, PostgreSQL, SQLite3)
 - [ ] Daemonization of each service
@@ -70,17 +70,33 @@ openssl req -x509 -newkey rsa:1024 -nodes -days 365 -subj /CN=fesl -keyout cert.
 
 | Option | Meaning |
 | --- | --- |
-| `-c CERT` | PEM file with the certificate and its passwordless private key |
-| `-a ACCOUNTS` | Accounts file, one `name password user_id` per line (see `accounts.example.txt`) |
+| `-c CERT` | PEM file with the certificate and its passwordless private key (not needed with `-X none`) |
+| `-a ACCOUNTS` | Accounts file, one `name password user_id [status]` per line (see `accounts.example.txt`) |
 | `-p PORT` / `-b IP` | Listening port (default 18300) and address |
-| `-X METHOD` | `ssl3` (default) or `tls`. A plain `make` build has no SSLv3 and needs `-X tls` |
-| `-i SECONDS` | Idle time before the server pings the client (default 30) |
+| `-X METHOD` | `ssl3` (default), `tls`, or `none` for plain TCP with a client patched to skip SSL. A plain `make` build has no SSLv3 |
+| `-i SECONDS` | Interval between server Pings, sent even while the client is busy (default 30) |
 
-The server answers Hello (and sends the MemCheck that follows it) and Login, and pings idle clients. Any other request gets a "Not implemented" error (`errorCode=99`).
+The server answers:
+
+- **Hello**, followed by an unsolicited MemCheck with packet number 0.
+- **Login**, checked against the accounts file.
+- **GetObjectInventory**, always with an empty inventory.
+
+It also sends a Ping every 30 seconds and closes connections that stay silent for 3 intervals. Any other request gets a "Not implemented" error (`errorCode=99`).
+
+Login errors:
+
+| Code | Meaning |
+| --- | --- |
+| 101 | Unknown user. Sent with `errorContainer` field `name` when the name is empty |
+| 122 | Wrong or missing password, with `errorContainer` field `password` |
+| 102 / 103 / 105 | Account `disabled` / `banned` / `pending` (the optional status column; only revealed after the right password) |
+| 121 | Too many attempts: after 5 failed Logins on one connection |
 
 > [!NOTE]
 > - The accounts file stores passwords in clear text. It's a stand-in until database support exists.
-> - The error codes (101 user not found, 122 wrong password) come from other FESL emulators and haven't been checked against the game.
+> - Codes 101 and 122 are used by the BFBC2 and NFS Carbon emulators, and the others were checked against the NFS Carbon client. None has been checked against BF2142.
+> - The MemCheck numbering and the fixed 30-second Ping follow EA's real NFS Carbon servers. Our BF2142 captures, made against an emulator, reused the Hello number for MemCheck.
 > - The game may reject a self-signed certificate. That hasn't been tested yet.
 
 ## Capturing game traffic

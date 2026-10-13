@@ -36,6 +36,7 @@ int fesl_accounts_parse(fesl_accounts *a, const char *text) {
                     *line_end,
                     *end;
     char            id[16],
+                    status[16],
                     *idend;
     fesl_account    acc,
                     *tmp;
@@ -55,7 +56,16 @@ int fesl_accounts_parse(fesl_accounts *a, const char *text) {
             p = next_word(p, end, acc.name, sizeof(acc.name));
             if(p) p = next_word(p, end, acc.password, sizeof(acc.password));
             if(p) p = next_word(p, end, id, sizeof(id));
-            if(!p || has_more(p, end)) goto invalid;
+            if(!p) goto invalid;
+            if(has_more(p, end)) {
+                p = next_word(p, end, status, sizeof(status));
+                if(!p || has_more(p, end)) goto invalid;
+                if(!strcasecmp(status, "active"))           acc.status = ACCOUNT_ACTIVE;
+                else if(!strcasecmp(status, "disabled"))    acc.status = ACCOUNT_DISABLED;
+                else if(!strcasecmp(status, "banned"))      acc.status = ACCOUNT_BANNED;
+                else if(!strcasecmp(status, "pending"))     acc.status = ACCOUNT_PENDING;
+                else goto invalid;
+            }
             n = strtoul(id, &idend, 10);
             if(*idend || !n || (n > 0xffffffffUL) || fesl_accounts_find(a, acc.name)) goto invalid;
             acc.user_id = n;

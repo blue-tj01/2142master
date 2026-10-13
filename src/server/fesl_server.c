@@ -6,9 +6,10 @@
     the Free Software Foundation; either version 2 of the License, or
     (at your option) any later version.
 
-    Handles Hello and Login, everything else gets a "Not implemented" error.
-    The game uses SSLv3, so the server must be built with "make ssl3" to
-    talk to it; "-X tls" accepts any TLS version for testing.
+    Handles Hello, Login and GetObjectInventory, everything else gets a
+    "Not implemented" error. The game uses SSLv3, so the server must be built
+    with "make ssl3" to talk to it; "-X tls" accepts any TLS version for
+    testing, and "-X none" speaks plain TCP to clients patched to skip SSL.
 */
 
 #include <stdio.h>
@@ -35,11 +36,12 @@
 #endif
 
 #define DEFAULT_PORT            18300
-#define DEFAULT_PING_INTERVAL   30      // seconds, like the captured server
-#define MAX_MISSED_PINGS        3
+#define DEFAULT_PING_INTERVAL   30      // seconds, retail sends a Ping this often even to busy clients
+#define MAX_SILENT_INTERVALS    3       // close after this many ping intervals without client data
+#define HANDSHAKE_TIMEOUT       30      // seconds
 
 typedef struct {
-    SSL_CTX     *ctx;
+    SSL_CTX     *ctx;           // NULL for plain TCP
     fesl_accounts accounts;
     int         ping_interval;
 } server;
@@ -71,15 +73,48 @@ static void print_ssl_errors(const char *peer) {
     }
 }
 
-static int send_all(SSL *ssl, const fesl_output *out) {
+// the client socket, with or without SSL
+typedef struct {
+    int         sd;
+    SSL         *ssl;
+} channel;
+
+// returns > 0 bytes, 0 on timeout, < 0 on close or error
+static int channel_read(channel *ch, uint8_t *buf, size_t len) {
+    int     n,
+            err;
+
+    if(ch->ssl) {
+        n = SSL_read(ch->ssl, buf, len);
+        if(n > 0) return n;
+        err = SSL_get_error(ch->ssl, n);
+        if((err == SSL_ERROR_WANT_READ) ||
+          ((err == SSL_ERROR_SYSCALL) && ((errno == EAGAIN) || (errno == EWOULDBLOCK)))) return 0;
+        return -1;
+    }
+    n = recv(ch->sd, buf, len, 0);
+    if(n > 0) return n;
+    if((n < 0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno == EINTR))) return 0;
+    return -1;
+}
+
+static int channel_write_all(channel *ch, const fesl_output *out) {
     size_t  off;
     int     n;
 
     for(off = 0; off < out->len; off += n) {
-        n = SSL_write(ssl, out->data + off, out->len - off);
+        if(ch->ssl) n = SSL_write(ch->ssl, out->data + off, out->len - off);
+        else        n = send(ch->sd, out->data + off, out->len - off, 0);
         if(n <= 0) return -1;
     }
     return 0;
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
 // logs the packets without their values, Login carries the password
@@ -99,7 +134,7 @@ static void log_packets(const char *peer, const char *dir, const uint8_t *data, 
 
 static void *client_thread(void *arg) {
     connection  *c = arg;
-    SSL         *ssl = NULL;
+    channel     ch = { .sd = c->sd, .ssl = NULL };
     uint8_t     *buf = NULL;
     size_t      len = 0,
                 consumed;
@@ -107,84 +142,93 @@ static void *client_thread(void *arg) {
     fesl_output out = { 0 };
     fesl_packet pkt;
     struct timeval tv;
+    double      now,
+                next_ping,
+                last_rx;
     int         n,
-                err,
                 ret,
-                missed = 0,
+                logged_in,
                 done = 0;
 
     printf("%s: connected\n", c->peer);
     buf = malloc(FESL_MAX_PACKET_SIZE);
-    ssl = SSL_new(c->srv->ctx);
-    if(!buf || !ssl) goto quit;
-    SSL_set_fd(ssl, c->sd);
+    if(!buf) goto quit;
 
-    tv.tv_sec  = c->srv->ping_interval;
+    tv.tv_sec  = HANDSHAKE_TIMEOUT;
     tv.tv_usec = 0;
     setsockopt(c->sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    if(SSL_accept(ssl) != 1) {
-        printf("%s: SSL handshake failed\n", c->peer);
-        print_ssl_errors(c->peer);
-        goto quit;
+    if(c->srv->ctx) {
+        ch.ssl = SSL_new(c->srv->ctx);
+        if(!ch.ssl) goto quit;
+        SSL_set_fd(ch.ssl, c->sd);
+        if(SSL_accept(ch.ssl) != 1) {
+            printf("%s: SSL handshake failed\n", c->peer);
+            print_ssl_errors(c->peer);
+            goto quit;
+        }
+        printf("%s: %s %s\n", c->peer, SSL_get_version(ch.ssl), SSL_get_cipher_name(ch.ssl));
     }
-    printf("%s: %s %s\n", c->peer, SSL_get_version(ssl), SSL_get_cipher_name(ssl));
     fesl_session_init(&session, &c->srv->accounts, ssl_random, NULL);
 
+    // short receive timeout so pings go out on time even while idle
+    tv.tv_sec  = 1;
+    setsockopt(c->sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    last_rx   = now_seconds();
+    next_ping = last_rx + c->srv->ping_interval;
     while(!done) {
-        n = SSL_read(ssl, buf + len, FESL_MAX_PACKET_SIZE - len);
-        if(n <= 0) {
-            err = SSL_get_error(ssl, n);
-            if((err == SSL_ERROR_WANT_READ) ||
-              ((err == SSL_ERROR_SYSCALL) && ((errno == EAGAIN) || (errno == EWOULDBLOCK)))) {
-                if(++missed >= MAX_MISSED_PINGS) {
-                    printf("%s: timeout\n", c->peer);
+        n = channel_read(&ch, buf + len, FESL_MAX_PACKET_SIZE - len);
+        if(n < 0) break;    // closed or error
+        now = now_seconds();
+
+        if(n > 0) {
+            last_rx = now;
+            len += n;
+            fesl_output_reset(&out);
+            for(;;) {
+                ret = fesl_decode(buf, len, &pkt, &consumed);
+                if(ret == FESL_NEED_MORE) break;
+                if(ret != FESL_OK) {
+                    printf("%s: invalid packet\n", c->peer);
+                    done = 1;
                     break;
                 }
-                fesl_output_reset(&out);
-                if((fesl_session_ping(&out) != FESL_SESSION_CONTINUE) || (send_all(ssl, &out) < 0)) break;
+                log_packets(c->peer, ">", buf, consumed);
+                memmove(buf, buf + consumed, len - consumed);
+                len -= consumed;
+
+                logged_in = !strcmp(pkt.command, "acct") && fesl_txn(&pkt) && !strcmp(fesl_txn(&pkt), "Login");
+                ret = fesl_session_handle(&session, &pkt, time(NULL), &out);
+                if(logged_in && session.account) printf("%s: logged in as %s\n", c->peer, session.account->name);
+                fesl_packet_free(&pkt);
+                if(ret != FESL_SESSION_CONTINUE) {
+                    done = 1;
+                    break;
+                }
+            }
+            if(out.len) {
                 log_packets(c->peer, "<", out.data, out.len);
-                continue;
+                if(channel_write_all(&ch, &out) < 0) break;
             }
-            break;  // closed or error
+        } else if(now - last_rx >= c->srv->ping_interval * MAX_SILENT_INTERVALS) {
+            printf("%s: timeout\n", c->peer);
+            break;
         }
-        missed = 0;
-        len += n;
 
-        fesl_output_reset(&out);
-        for(;;) {
-            ret = fesl_decode(buf, len, &pkt, &consumed);
-            if(ret == FESL_NEED_MORE) break;
-            if(ret != FESL_OK) {
-                printf("%s: invalid packet\n", c->peer);
-                done = 1;
-                break;
-            }
-            log_packets(c->peer, ">", buf, consumed);
-            memmove(buf, buf + consumed, len - consumed);
-            len -= consumed;
-
-            ret = fesl_session_handle(&session, &pkt, time(NULL), &out);
-            if(!strcmp(pkt.command, "acct") && fesl_txn(&pkt) && !strcmp(fesl_txn(&pkt), "Login") && session.account) {
-                printf("%s: logged in as %s\n", c->peer, session.account->name);
-            }
-            fesl_packet_free(&pkt);
-            if(ret != FESL_SESSION_CONTINUE) {
-                done = 1;
-                break;
-            }
-        }
-        if(out.len) {
+        if(!done && (now >= next_ping)) {
+            fesl_output_reset(&out);
+            if((fesl_session_ping(&out) != FESL_SESSION_CONTINUE) || (channel_write_all(&ch, &out) < 0)) break;
             log_packets(c->peer, "<", out.data, out.len);
-            if(send_all(ssl, &out) < 0) break;
+            next_ping = now + c->srv->ping_interval;
         }
     }
 
 quit:
     printf("%s: disconnected\n", c->peer);
-    if(ssl) {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
+    if(ch.ssl) {
+        SSL_shutdown(ch.ssl);
+        SSL_free(ch.ssl);
     }
     close(c->sd);
     fesl_output_free(&out);
@@ -232,11 +276,13 @@ static void usage(const char *prog) {
         "Usage: %s [options] -c CERT -a ACCOUNTS\n"
         "\n"
         "-c CERT      PEM file with the certificate and its passwordless private key\n"
+        "             (not needed with -X none)\n"
         "-a ACCOUNTS  accounts file, one \"name password user_id\" per line\n"
         "-p PORT      port to listen on (default %d)\n"
         "-b IP        address to listen on (default all)\n"
-        "-X METHOD    ssl3 (default, what the game uses) or tls (any TLS version)\n"
-        "-i SECONDS   idle time before pinging the client (default %d)\n",
+        "-X METHOD    ssl3 (default, what the game uses), tls (any TLS version) or\n"
+        "             none (plain TCP, for clients patched to skip SSL)\n"
+        "-i SECONDS   interval between the server Pings (default %d)\n",
         prog, DEFAULT_PORT, DEFAULT_PING_INTERVAL);
     exit(1);
 }
@@ -271,7 +317,7 @@ int main(int argc, char *argv[]) {
             default:  usage(argv[0]);
         }
     }
-    if(!cert_file || !accounts_file || (optind != argc) ||
+    if((!cert_file && strcmp(method, "none")) || !accounts_file || (optind != argc) ||
        (port <= 0) || (port > 65535) || (srv.ping_interval <= 0)) usage(argv[0]);
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -284,8 +330,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    srv.ctx = create_ssl_ctx(cert_file, method);
-    if(!srv.ctx) return 1;
+    if(strcmp(method, "none")) {
+        srv.ctx = create_ssl_ctx(cert_file, method);
+        if(!srv.ctx) return 1;
+    }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
